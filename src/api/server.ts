@@ -17,7 +17,14 @@ export function buildServer() {
     logger: true,
   });
 
-  server.post('/webhooks/ingest', async (request, reply) => {
+  server.post('/webhooks/ingest', {
+    onRequest(request, reply, done) {
+      const log = request.log.child({ requestId: uuidv4() });
+      request.log = log;
+      reply.log = log;
+      done();
+    },
+  }, async (request, reply) => {
     const parsed = webhookPayloadSchema.safeParse(request.body);
 
     if (!parsed.success) {
