@@ -3,6 +3,7 @@ import pino from 'pino';
 import { getRetryQueue, updateStatus } from '../db/client';
 import type { DeadLetterRecord, DeliveryError, DLQStatus } from '../types';
 import { calculateBackoffMs } from './backoff';
+import { CircuitBreaker } from './circuitBreaker';
 
 const logger = pino({ name: 'replay-engine' });
 
@@ -45,6 +46,7 @@ export class ReplayEngine {
   private processing = false;
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
+  private breakers = new Map<string, CircuitBreaker>();
 
   constructor(private readonly pollIntervalMs: number) {}
 
@@ -109,7 +111,30 @@ export class ReplayEngine {
     });
   }
 
+  private getBreaker(url: string): CircuitBreaker {
+    let breaker = this.breakers.get(url);
+
+    if (!breaker) {
+      breaker = new CircuitBreaker();
+      this.breakers.set(url, breaker);
+    }
+
+    return breaker;
+  }
+
   private async processRecord(record: DeadLetterRecord): Promise<void> {
+    const url = record.event.targetUrl;
+    const breaker = this.getBreaker(url);
+
+    if (!breaker.canRequest()) {
+      logger.info({
+        event: 'dlq.circuit_open',
+        recordId: record.id,
+        targetUrl: url,
+      });
+      return;
+    }
+
     const now = new Date().toISOString();
 
     try {
@@ -120,6 +145,7 @@ export class ReplayEngine {
       });
 
       if (response.status >= 200 && response.status < 300) {
+        breaker.recordSuccess();
         this.logTransition(record, record.status, 'DELIVERED');
         updateStatus(record.id, 'DELIVERED', {
           lastAttemptAt: now,
@@ -139,6 +165,7 @@ export class ReplayEngine {
           now,
           buildDeliveryError('RATE_LIMITED', 'Target returned HTTP 429', true, 429),
         );
+        breaker.recordFailure();
 
         if (retryAfterSeconds !== null) {
           updateStatus(record.id, 'RETRYING', {
@@ -158,6 +185,7 @@ export class ReplayEngine {
           response.status,
         ),
       );
+      breaker.recordFailure();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Network request failed';
 
@@ -166,6 +194,7 @@ export class ReplayEngine {
         now,
         buildDeliveryError('NETWORK_ERROR', message, true),
       );
+      breaker.recordFailure();
     }
   }
 
