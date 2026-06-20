@@ -57,6 +57,7 @@ export function buildServer() {
   });
 
   server.removeContentTypeParser('application/json');
+  server.removeContentTypeParser('text/plain');
   server.addContentTypeParser(
     'application/json',
     { parseAs: 'string' },

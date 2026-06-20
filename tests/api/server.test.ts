@@ -117,6 +117,41 @@ describe('API server', () => {
         error: 'VALIDATION_FAILED',
       });
     });
+
+    it('returns 413 PAYLOAD_TOO_LARGE when payload exceeds 512KB', async () => {
+      const largePayload = 'x'.repeat(512 * 1024 + 1);
+
+      const response = await server.inject({
+        method: 'POST',
+        url: '/webhooks/ingest',
+        payload: {
+          endpoint_url: 'https://example.com/webhook',
+          http_method: 'POST',
+          payload: { data: largePayload },
+          retry_policy: { kind: 'bounded', maxAttempts: 3 },
+        },
+      });
+
+      expect(response.statusCode).toBe(413);
+      expect(response.json()).toEqual({
+        error: 'PAYLOAD_TOO_LARGE',
+        maxBytes: 512 * 1024,
+      });
+    });
+
+    it('returns 415 UNSUPPORTED_MEDIA_TYPE for non-JSON content type', async () => {
+      const response = await server.inject({
+        method: 'POST',
+        url: '/webhooks/ingest',
+        headers: {
+          'content-type': 'text/plain',
+        },
+        payload: 'not json',
+      });
+
+      expect(response.statusCode).toBe(415);
+      expect(response.json()).toEqual({ error: 'UNSUPPORTED_MEDIA_TYPE' });
+    });
   });
 
   describe('GET /health', () => {
@@ -130,6 +165,25 @@ describe('API server', () => {
       expect(response.json()).toMatchObject({
         status: 'ok',
         db: 'connected',
+      });
+    });
+
+    it('returns 503 degraded when DB probe fails', async () => {
+      const prepareSpy = vi.spyOn(db, 'prepare').mockImplementation(() => {
+        throw new Error('DB unreachable');
+      });
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/health',
+      });
+
+      prepareSpy.mockRestore();
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        status: 'degraded',
+        db: 'unreachable',
       });
     });
   });
