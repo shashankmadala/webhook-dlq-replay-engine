@@ -243,6 +243,46 @@ describe('API server', () => {
         ids: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
       });
     });
+
+    it('falls back to default limit when bulk replay limit is invalid', async () => {
+      insertRecord(createDeadRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
+      insertRecord(createDeadRecord('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'));
+
+      const negativeLimitResponse = await server.inject({
+        method: 'POST',
+        url: '/webhooks/replay/bulk',
+        payload: {
+          limit: -1,
+        },
+      });
+
+      expect(negativeLimitResponse.statusCode).toBe(200);
+      expect(negativeLimitResponse.json()).toEqual({
+        requeued: 1,
+        ids: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+      });
+
+      db.exec('DELETE FROM dead_letter_records');
+      insertRecord(createDeadRecord('cccccccc-cccc-4ccc-8ccc-cccccccccccc'));
+      insertRecord(createDeadRecord('dddddddd-dddd-4ddd-8ddd-dddddddddddd'));
+
+      const invalidLimitResponse = await server.inject({
+        method: 'POST',
+        url: '/webhooks/replay/bulk',
+        payload: {
+          limit: 'invalid',
+        },
+      });
+
+      expect(invalidLimitResponse.statusCode).toBe(200);
+      expect(invalidLimitResponse.json()).toEqual({
+        requeued: 2,
+        ids: [
+          'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+          'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        ],
+      });
+    });
   });
 
   describe('GET /webhooks/records', () => {
@@ -364,6 +404,21 @@ describe('API server', () => {
       });
     });
 
+    it('returns 400 for invalid created_before ISO 8601 timestamp', async () => {
+      const response = await server.inject({
+        method: 'GET',
+        url: '/webhooks/records?created_before=not-a-date',
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: 'VALIDATION_FAILED',
+        details: [
+          { message: 'created_before must be a valid ISO 8601 timestamp' },
+        ],
+      });
+    });
+
     it('paginates with cursor and limit', async () => {
       insertRecord(createRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
       insertRecord(createRecord('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'));
@@ -399,6 +454,40 @@ describe('API server', () => {
         'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
       );
       expect(secondBody.nextCursor).toBeNull();
+    });
+  });
+
+  describe('GET /metrics', () => {
+    it('returns 200 with summary counts and uptime', async () => {
+      insertRecord(createRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
+      insertRecord(createDeadRecord('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'));
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/metrics',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json() as {
+        summary: {
+          total: number;
+          pending: number;
+          retrying: number;
+          delivered: number;
+          dead: number;
+        };
+        uptime_seconds: number;
+      };
+
+      expect(body.summary).toMatchObject({
+        total: expect.any(Number),
+        pending: expect.any(Number),
+        retrying: expect.any(Number),
+        delivered: expect.any(Number),
+        dead: expect.any(Number),
+      });
+      expect(body.uptime_seconds).toEqual(expect.any(Number));
+      expect(body.summary.total).toBeGreaterThan(0);
     });
   });
 
