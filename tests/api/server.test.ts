@@ -191,6 +191,163 @@ describe('API server', () => {
     });
   });
 
+  describe('GET /webhooks/records', () => {
+    it('returns all records regardless of status', async () => {
+      insertRecord(createRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
+      insertRecord(
+        createDeadRecord('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
+      );
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/webhooks/records',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json() as {
+        records: Array<{ id: string; status: string }>;
+        nextCursor: string | null;
+      };
+      expect(body.records).toHaveLength(2);
+      expect(body.records.map((record) => record.status).sort()).toEqual([
+        'DEAD',
+        'PENDING',
+      ]);
+      expect(body.nextCursor).toBeNull();
+    });
+
+    it('filters by status', async () => {
+      insertRecord(createRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
+      insertRecord(
+        createDeadRecord('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
+      );
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/webhooks/records?status=DEAD',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json() as {
+        records: Array<{ id: string; status: string }>;
+      };
+      expect(body.records).toHaveLength(1);
+      expect(body.records[0]?.status).toBe('DEAD');
+    });
+
+    it('filters by endpoint_url using LIKE match', async () => {
+      insertRecord(
+        createDeadRecord(
+          'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          'https://example.com/webhook',
+        ),
+      );
+      insertRecord(
+        createDeadRecord(
+          'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          'https://other.example.com/webhook',
+        ),
+      );
+
+      const response = await server.inject({
+        method: 'GET',
+        url: '/webhooks/records?endpoint_url=https://example.com/webhook',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json() as { records: Array<{ id: string }> };
+      expect(body.records).toHaveLength(1);
+      expect(body.records[0]?.id).toBe('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+    });
+
+    it('filters by created_after and created_before date range', async () => {
+      const oldRecord = createRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+      oldRecord.createdAt = '2026-01-01T00:00:00.000Z';
+      insertRecord(oldRecord);
+
+      const midRecord = createRecord('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+      midRecord.createdAt = '2026-06-15T12:00:00.000Z';
+      insertRecord(midRecord);
+
+      const newRecord = createRecord('cccccccc-cccc-4ccc-8ccc-cccccccccccc');
+      newRecord.createdAt = '2026-12-01T00:00:00.000Z';
+      insertRecord(newRecord);
+
+      const response = await server.inject({
+        method: 'GET',
+        url:
+          '/webhooks/records?created_after=2026-06-01T00:00:00.000Z' +
+          '&created_before=2026-07-01T00:00:00.000Z',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json() as { records: Array<{ id: string }> };
+      expect(body.records).toHaveLength(1);
+      expect(body.records[0]?.id).toBe('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+    });
+
+    it('returns 400 for invalid status', async () => {
+      const response = await server.inject({
+        method: 'GET',
+        url: '/webhooks/records?status=INVALID',
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: 'VALIDATION_FAILED',
+      });
+    });
+
+    it('returns 400 for invalid created_after ISO 8601 timestamp', async () => {
+      const response = await server.inject({
+        method: 'GET',
+        url: '/webhooks/records?created_after=not-a-date',
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: 'VALIDATION_FAILED',
+      });
+    });
+
+    it('paginates with cursor and limit', async () => {
+      insertRecord(createRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
+      insertRecord(createRecord('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'));
+      insertRecord(createRecord('cccccccc-cccc-4ccc-8ccc-cccccccccccc'));
+
+      const firstPage = await server.inject({
+        method: 'GET',
+        url: '/webhooks/records?limit=2',
+      });
+
+      expect(firstPage.statusCode).toBe(200);
+      const firstBody = firstPage.json() as {
+        records: Array<{ id: string }>;
+        nextCursor: string | null;
+      };
+      expect(firstBody.records).toHaveLength(2);
+      expect(firstBody.nextCursor).toBe(
+        'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      );
+
+      const secondPage = await server.inject({
+        method: 'GET',
+        url: `/webhooks/records?limit=2&cursor=${firstBody.nextCursor}`,
+      });
+
+      expect(secondPage.statusCode).toBe(200);
+      const secondBody = secondPage.json() as {
+        records: Array<{ id: string }>;
+        nextCursor: string | null;
+      };
+      expect(secondBody.records).toHaveLength(1);
+      expect(secondBody.records[0]?.id).toBe(
+        'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      );
+      expect(secondBody.nextCursor).toBeNull();
+    });
+  });
+
   describe('POST /webhooks/replay/:id', () => {
     it('returns 200 RETRYING for an existing record', async () => {
       const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';

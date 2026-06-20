@@ -361,6 +361,59 @@ export function getDeadLetters(cursor?: string, limit = 50): DeadLetterRecord[] 
   return rows.map(rowToRecord);
 }
 
+export interface ListRecordsFilters {
+  status?: DLQStatus;
+  endpointUrl?: string;
+  createdAfter?: string;
+  createdBefore?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export function listRecords(filters: ListRecordsFilters = {}): DeadLetterRecord[] {
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+
+  if (filters.status !== undefined) {
+    conditions.push('status = ?');
+    values.push(filters.status);
+  }
+
+  if (filters.endpointUrl !== undefined) {
+    conditions.push('endpoint_url LIKE ?');
+    values.push(filters.endpointUrl);
+  }
+
+  if (filters.createdAfter !== undefined) {
+    conditions.push('created_at >= ?');
+    values.push(filters.createdAfter);
+  }
+
+  if (filters.createdBefore !== undefined) {
+    conditions.push('created_at <= ?');
+    values.push(filters.createdBefore);
+  }
+
+  if (filters.cursor !== undefined) {
+    conditions.push('id > ?');
+    values.push(filters.cursor);
+  }
+
+  const whereClause =
+    conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const limit = filters.limit ?? 50;
+
+  values.push(limit);
+
+  const rows = db
+    .prepare(
+      `SELECT * FROM dead_letter_records ${whereClause} ORDER BY id ASC LIMIT ?`,
+    )
+    .all(...values) as DbRow[];
+
+  return rows.map(rowToRecord);
+}
+
 export function getBulkReplayTargets(
   status: DLQStatus,
   endpointUrl?: string,
