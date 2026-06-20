@@ -1,4 +1,4 @@
-import dns from 'node:dns';
+import { lookupSync } from 'node:dns';
 import { isIP } from 'node:net';
 
 export class SsrfBlockedError extends Error {
@@ -87,7 +87,7 @@ function isBlockedIp(address: string): boolean {
 
 function resolveHostname(hostname: string): string | null {
   try {
-    const { address } = dns.lookupSync(hostname, { verbatim: true });
+    const { address } = lookupSync(hostname, { verbatim: true });
     return address;
   } catch {
     return null;

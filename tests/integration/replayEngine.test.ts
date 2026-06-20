@@ -3,9 +3,17 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const lookupSyncMock = vi.hoisted(() =>
+  vi.fn(() => ({ address: '93.184.216.34', family: 4 })),
+);
+
 vi.hoisted(() => {
   process.env.DB_PATH = ':memory:';
 });
+
+vi.mock('node:dns', () => ({
+  lookupSync: (...args: unknown[]) => lookupSyncMock(...args),
+}));
 
 import { db, getRecordById, insertRecord } from '../../src/db/client';
 import { ReplayEngine } from '../../src/engine/replayEngine';
@@ -78,6 +86,8 @@ describe('ReplayEngine integration', () => {
     db.exec(schemaSql);
     db.exec('DELETE FROM dead_letter_records');
 
+    lookupSyncMock.mockReturnValue({ address: '93.184.216.34', family: 4 });
+
     mockFetch = vi.fn(async (url: string) => {
       if (url === URL_2XX) {
         return new Response('ok', { status: 200 });
@@ -101,7 +111,7 @@ describe('ReplayEngine integration', () => {
   afterEach(() => {
     engine.stop();
     vi.unstubAllGlobals();
-    vi.clearAllMocks();
+    lookupSyncMock.mockReset();
   });
 
   it('processes 2xx, 5xx, and network error records in one batch', async () => {

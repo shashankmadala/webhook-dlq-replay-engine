@@ -18,6 +18,7 @@ import type {
   RetryBackoffConfig,
 } from '../types';
 import { webhookPayloadSchema } from '../validators/webhookPayload';
+import { isSafeUrl } from '../security/ssrfGuard';
 
 const DEFAULT_RETRY_BACKOFF: RetryBackoffConfig = {
   baseDelayMs: 1_000,
@@ -111,6 +112,13 @@ export function buildServer() {
       return reply.status(413).send({
         error: 'PAYLOAD_TOO_LARGE',
         maxBytes: 512 * 1024,
+      });
+    }
+
+    if (!isSafeUrl(parsed.data.endpoint_url)) {
+      return reply.status(400).send({
+        error: 'SSRF_BLOCKED_URL',
+        message: 'The endpoint URL resolves to a blocked IP range',
       });
     }
 

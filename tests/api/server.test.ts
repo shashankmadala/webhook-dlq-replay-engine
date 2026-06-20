@@ -1,8 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const lookupSyncMock = vi.hoisted(() =>
+  vi.fn(() => ({ address: '93.184.216.34', family: 4 })),
+);
+
 vi.hoisted(() => {
   process.env.DB_PATH = ':memory:';
 });
+
+vi.mock('node:dns', () => ({
+  lookupSync: (...args: unknown[]) => lookupSyncMock(...args),
+}));
 
 import { buildServer } from '../../src/api/server';
 import { db, getRecordById, insertRecord } from '../../src/db/client';
@@ -72,6 +80,7 @@ describe('API server', () => {
   let server: ReturnType<typeof buildServer>;
 
   beforeEach(async () => {
+    lookupSyncMock.mockReturnValue({ address: '93.184.216.34', family: 4 });
     db.exec('DELETE FROM dead_letter_records');
     server = buildServer();
     await server.ready();
@@ -79,6 +88,7 @@ describe('API server', () => {
 
   afterEach(async () => {
     await server.close();
+    lookupSyncMock.mockReset();
   });
 
   describe('POST /webhooks/ingest', () => {

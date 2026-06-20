@@ -1,6 +1,7 @@
 import pino from 'pino';
 
 import { getRetryQueue, updateStatus } from '../db/client';
+import { assertSafeUrl, SsrfBlockedError } from '../security/ssrfGuard';
 import type { DeadLetterRecord, DeliveryError, DLQStatus } from '../types';
 import { calculateBackoffMs } from './backoff';
 import { CircuitBreaker } from './circuitBreaker';
@@ -124,6 +125,34 @@ export class ReplayEngine {
 
   private async processRecord(record: DeadLetterRecord): Promise<void> {
     const url = record.event.targetUrl;
+    const now = new Date().toISOString();
+
+    try {
+      await assertSafeUrl(url);
+    } catch (error) {
+      if (error instanceof SsrfBlockedError) {
+        logger.info({
+          event: 'dlq.egress_blocked',
+          recordId: record.id,
+          targetUrl: url,
+        });
+        this.logTransition(record, record.status, 'DEAD', {
+          errorCode: 'SSRF_BLOCKED',
+        });
+        updateStatus(record.id, 'DEAD', {
+          lastError: buildDeliveryError(
+            'SSRF_BLOCKED',
+            'The endpoint URL resolves to a blocked IP range',
+            false,
+          ),
+          lastAttemptAt: now,
+        });
+        return;
+      }
+
+      throw error;
+    }
+
     const breaker = this.getBreaker(url);
 
     if (!breaker.canRequest()) {
@@ -134,8 +163,6 @@ export class ReplayEngine {
       });
       return;
     }
-
-    const now = new Date().toISOString();
 
     try {
       const response = await fetch(record.event.targetUrl, {
