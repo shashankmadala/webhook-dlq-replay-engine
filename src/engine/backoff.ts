@@ -31,7 +31,7 @@ export function calculateBackoffMs(
   const delay = randomBetween(0, cappedDelay);
 
   if (policy.kind === 'ttl') {
-    if (Date.now() + delay > policy.expiresAt.getTime()) {
+    if (Date.now() + delay >= policy.expiresAt.getTime()) {
       return 0;
     }
   }

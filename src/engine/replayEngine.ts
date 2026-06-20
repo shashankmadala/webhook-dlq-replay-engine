@@ -107,31 +107,21 @@ export class ReplayEngine {
       if (response.status === 429) {
         const retryAfter = response.headers.get('Retry-After');
         const retryAfterSeconds =
-          retryAfter !== null && retryAfter !== '' && !Number.isNaN(Number(retryAfter))
+          retryAfter !== null && !Number.isNaN(Number(retryAfter))
             ? Number(retryAfter)
             : null;
 
-        const nextRetryAt =
-          retryAfterSeconds !== null
-            ? nextRetryAtFromRetryAfterSeconds(retryAfterSeconds)
-            : nextRetryAtFromDelayMs(
-                calculateBackoffMs(
-                  record.attemptCount,
-                  record.retryPolicy,
-                  record.retryBackoff,
-                ),
-              );
+        await this.handleFailure(
+          record,
+          now,
+          buildDeliveryError('RATE_LIMITED', 'Target returned HTTP 429', true, 429),
+        );
 
-        updateStatus(record.id, 'RETRYING', {
-          nextRetryAt,
-          lastAttemptAt: now,
-          lastError: buildDeliveryError(
-            'RATE_LIMITED',
-            `Target returned HTTP 429`,
-            true,
-            429,
-          ),
-        });
+        if (retryAfterSeconds !== null) {
+          updateStatus(record.id, 'RETRYING', {
+            nextRetryAt: nextRetryAtFromRetryAfterSeconds(retryAfterSeconds),
+          });
+        }
         return;
       }
 
