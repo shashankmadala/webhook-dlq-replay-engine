@@ -90,7 +90,7 @@ const getRetryQueueStmt = db.prepare(`
     next_retry_at
   FROM dead_letter_records
   WHERE (status = 'PENDING' OR status = 'RETRYING')
-    AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+    AND (next_retry_at IS NULL OR next_retry_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
   ORDER BY next_retry_at ASC, created_at ASC
   LIMIT ?
 `);

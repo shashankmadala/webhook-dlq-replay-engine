@@ -1,3 +1,25 @@
+# .gitignore
+
+```
+node_modules/
+dist/
+dlq.db
+*.js.map
+
+```
+
+# dlq.db
+
+This is a binary file of the type: Binary
+
+# dlq.db-shm
+
+This is a binary file of the type: Binary
+
+# dlq.db-wal
+
+This is a binary file of the type: Binary
+
 # docs/ADR-001-sqlite.md
 
 ```md
@@ -170,6 +192,832 @@ Inbound Webhook → Ingestion Layer → DLQ Store → Replay Engine → Target E
 
 ```
 
+# package.json
+
+```json
+{
+  "name": "webhook-dlq",
+  "version": "1.0.0",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shashankmadala/webhook-dlq-replay-engine.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/shashankmadala/webhook-dlq-replay-engine/issues"
+  },
+  "homepage": "https://github.com/shashankmadala/webhook-dlq-replay-engine#readme",
+  "description": "",
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "fastify": "^5.8.5",
+    "pino": "^10.3.1",
+    "uuid": "^14.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^26.0.0",
+    "@types/uuid": "^10.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}
+
+```
+
+# src/api/server.ts
+
+```ts
+import Fastify from 'fastify';
+import { v4 as uuidv4 } from 'uuid';
+
+import { db, getDeadLetters, getRecordById, insertRecord, updateStatus } from '../db/client';
+import type { DeadLetterRecord, HttpHeaders, RetryBackoffConfig } from '../types';
+import { webhookPayloadSchema } from '../validators/webhookPayload';
+
+const DEFAULT_RETRY_BACKOFF: RetryBackoffConfig = {
+  baseDelayMs: 1_000,
+  maxDelayMs: 300_000,
+  backoffMultiplier: 2,
+  jitterFactor: 0.1,
+};
+
+export function buildServer() {
+  const server = Fastify({
+    logger: true,
+  });
+
+  server.post('/webhooks/ingest', async (request, reply) => {
+    const parsed = webhookPayloadSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: 'VALIDATION_FAILED',
+        details: parsed.error.issues,
+      });
+    }
+
+    const payload = parsed.data;
+    const id = uuidv4();
+    const now = new Date().toISOString();
+
+    const record: DeadLetterRecord = {
+      id,
+      event: {
+        id,
+        targetUrl: payload.endpoint_url,
+        method: payload.http_method,
+        headers: payload.headers as HttpHeaders,
+        body: JSON.stringify(payload.payload),
+        receivedAt: now,
+      },
+      status: 'PENDING',
+      attemptCount: 0,
+      retryPolicy: payload.retry_policy,
+      retryBackoff: DEFAULT_RETRY_BACKOFF,
+      nextRetryAt: null,
+      lastAttemptAt: null,
+      lastError: null,
+      createdAt: now,
+      updatedAt: now,
+      finalizedAt: null,
+    };
+
+    insertRecord(record);
+
+    return reply.status(202).send({
+      id,
+      status: 'PENDING',
+    });
+  });
+
+  server.get<{
+    Querystring: { cursor?: string; limit?: string };
+  }>('/webhooks/dead-letters', async (request, reply) => {
+    const rawLimit = request.query.limit;
+    let limit = 50;
+
+    if (rawLimit !== undefined) {
+      const parsedLimit = Number.parseInt(rawLimit, 10);
+      if (!Number.isNaN(parsedLimit)) {
+        limit = Math.min(Math.max(parsedLimit, 1), 200);
+      }
+    }
+
+    const records = getDeadLetters(request.query.cursor, limit);
+    const nextCursor =
+      records.length < limit ? null : (records[records.length - 1]?.id ?? null);
+
+    return reply.send({
+      records,
+      nextCursor,
+    });
+  });
+
+  server.post<{ Params: { id: string } }>(
+    '/webhooks/replay/:id',
+    async (request, reply) => {
+      const record = getRecordById(request.params.id);
+
+      if (!record) {
+        return reply.status(404).send({ error: 'NOT_FOUND' });
+      }
+
+      updateStatus(record.id, 'RETRYING', {
+        nextRetryAt: new Date().toISOString(),
+      });
+
+      return reply.send({
+        id: record.id,
+        status: 'RETRYING',
+        message: 'Record queued for immediate replay',
+      });
+    },
+  );
+
+  server.get('/health', async (_request, reply) => {
+    try {
+      db.prepare('SELECT 1').get();
+
+      return reply.send({
+        status: 'ok',
+        uptime: process.uptime(),
+        db: 'connected',
+      });
+    } catch {
+      return reply.status(503).send({
+        status: 'degraded',
+        db: 'unreachable',
+      });
+    }
+  });
+
+  return server;
+}
+
+```
+
+# src/db/client.ts
+
+```ts
+import fs from 'node:fs';
+import path from 'node:path';
+
+import Database, { type Database as DatabaseInstance } from 'better-sqlite3';
+
+import type {
+  DeadLetterRecord,
+  DeliveryError,
+  DLQStatus,
+  HttpMethod,
+  RetryBackoffConfig,
+  RetryPolicy,
+} from '../types';
+
+const DB_PATH = 'dlq.db';
+const SCHEMA_PATH = path.join(__dirname, 'schema.sql');
+const DEFAULT_RETRY_BACKOFF: RetryBackoffConfig = {
+  baseDelayMs: 1_000,
+  maxDelayMs: 300_000,
+  backoffMultiplier: 2,
+  jitterFactor: 0.1,
+};
+
+interface DbRow {
+  id: string;
+  endpoint_url: string;
+  http_method: string;
+  payload: string;
+  headers: string;
+  status: string;
+  retry_policy: string;
+  attempt_count: number;
+  last_attempted_at: string | null;
+  next_retry_at: string | null;
+  created_at: string;
+  error_log: string | null;
+}
+
+interface RetryQueueRow {
+  id: string;
+  endpoint_url: string;
+  http_method: string;
+  payload: string;
+  headers: string;
+  retry_policy: string;
+  attempt_count: number;
+  next_retry_at: string | null;
+}
+
+type SerializedRetryPolicy =
+  | { kind: 'bounded'; maxAttempts: number }
+  | { kind: 'ttl'; expiresAt: string };
+
+interface StoredRetryPolicy {
+  policy: SerializedRetryPolicy;
+  backoff: RetryBackoffConfig;
+}
+
+const db: DatabaseInstance = new Database(DB_PATH);
+
+const schemaSql = fs.readFileSync(SCHEMA_PATH, 'utf8');
+db.exec(schemaSql);
+
+const insertRecordStmt = db.prepare(`
+  INSERT INTO dead_letter_records (
+    id,
+    endpoint_url,
+    http_method,
+    payload,
+    headers,
+    status,
+    retry_policy,
+    attempt_count,
+    last_attempted_at,
+    next_retry_at,
+    created_at,
+    error_log
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const getRetryQueueStmt = db.prepare(`
+  SELECT
+    id,
+    endpoint_url,
+    http_method,
+    payload,
+    headers,
+    retry_policy,
+    attempt_count,
+    next_retry_at
+  FROM dead_letter_records
+  WHERE (status = 'PENDING' OR status = 'RETRYING')
+    AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+  ORDER BY next_retry_at ASC, created_at ASC
+  LIMIT ?
+`);
+
+const getDeadLettersStmt = db.prepare(`
+  SELECT *
+  FROM dead_letter_records
+  WHERE status = 'DEAD'
+    AND (? IS NULL OR id > ?)
+  ORDER BY id ASC
+  LIMIT ?
+`);
+
+function serializeRetryPolicyValue(
+  policy: RetryPolicy,
+  backoff: RetryBackoffConfig,
+): string {
+  const serializedPolicy: SerializedRetryPolicy =
+    policy.kind === 'ttl'
+      ? {
+          kind: 'ttl',
+          expiresAt: policy.expiresAt.toISOString(),
+        }
+      : policy;
+
+  const stored: StoredRetryPolicy = {
+    policy: serializedPolicy,
+    backoff,
+  };
+
+  return JSON.stringify(stored);
+}
+
+function serializeRetryPolicy(record: DeadLetterRecord): string {
+  return serializeRetryPolicyValue(record.retryPolicy, record.retryBackoff);
+}
+
+function reviveRetryPolicy(policy: SerializedRetryPolicy | RetryPolicy): RetryPolicy {
+  if (policy.kind === 'ttl') {
+    return {
+      kind: 'ttl',
+      expiresAt:
+        policy.expiresAt instanceof Date
+          ? policy.expiresAt
+          : new Date(policy.expiresAt),
+    };
+  }
+
+  return policy;
+}
+
+function parseRetryPolicy(raw: string): {
+  policy: RetryPolicy;
+  backoff: RetryBackoffConfig;
+} {
+  const parsed = JSON.parse(raw) as StoredRetryPolicy | RetryPolicy;
+
+  if ('policy' in parsed && parsed.policy) {
+    return {
+      policy: reviveRetryPolicy(parsed.policy),
+      backoff: parsed.backoff ?? DEFAULT_RETRY_BACKOFF,
+    };
+  }
+
+  return {
+    policy: reviveRetryPolicy(parsed as RetryPolicy),
+    backoff: DEFAULT_RETRY_BACKOFF,
+  };
+}
+
+function parseHeaders(raw: string): DeadLetterRecord['event']['headers'] {
+  return JSON.parse(raw) as DeadLetterRecord['event']['headers'];
+}
+
+function parseErrorLog(raw: string | null): DeliveryError | null {
+  if (!raw) {
+    return null;
+  }
+
+  return JSON.parse(raw) as DeliveryError;
+}
+
+function rowToRecord(row: DbRow): DeadLetterRecord {
+  const { policy, backoff } = parseRetryPolicy(row.retry_policy);
+  const status = row.status as DLQStatus;
+  const finalizedAt =
+    status === 'DELIVERED' || status === 'DEAD' ? row.last_attempted_at : null;
+
+  return {
+    id: row.id,
+    event: {
+      id: row.id,
+      targetUrl: row.endpoint_url,
+      method: row.http_method as HttpMethod,
+      headers: parseHeaders(row.headers),
+      body: row.payload,
+      receivedAt: row.created_at,
+    },
+    status,
+    attemptCount: row.attempt_count,
+    retryPolicy: policy,
+    retryBackoff: backoff,
+    nextRetryAt: row.next_retry_at,
+    lastAttemptAt: row.last_attempted_at,
+    lastError: parseErrorLog(row.error_log),
+    createdAt: row.created_at,
+    updatedAt: row.created_at,
+    finalizedAt,
+  };
+}
+
+function rowToRecordFromRetryQueue(row: RetryQueueRow): DeadLetterRecord {
+  const { policy, backoff } = parseRetryPolicy(row.retry_policy);
+
+  return {
+    id: row.id,
+    event: {
+      id: row.id,
+      targetUrl: row.endpoint_url,
+      method: row.http_method as HttpMethod,
+      headers: parseHeaders(row.headers),
+      body: row.payload,
+      receivedAt: row.next_retry_at ?? new Date().toISOString(),
+    },
+    status: 'PENDING',
+    attemptCount: row.attempt_count,
+    retryPolicy: policy,
+    retryBackoff: backoff,
+    nextRetryAt: row.next_retry_at,
+    lastAttemptAt: null,
+    lastError: null,
+    createdAt: row.next_retry_at ?? new Date().toISOString(),
+    updatedAt: row.next_retry_at ?? new Date().toISOString(),
+    finalizedAt: null,
+  };
+}
+
+export function insertRecord(record: DeadLetterRecord): void {
+  insertRecordStmt.run(
+    record.id,
+    record.event.targetUrl,
+    record.event.method,
+    record.event.body,
+    JSON.stringify(record.event.headers),
+    record.status,
+    serializeRetryPolicy(record),
+    record.attemptCount,
+    record.lastAttemptAt,
+    record.nextRetryAt,
+    record.createdAt,
+    record.lastError ? JSON.stringify(record.lastError) : null,
+  );
+}
+
+export function updateStatus(
+  id: string,
+  status: DeadLetterRecord['status'],
+  patch?: Partial<DeadLetterRecord>,
+): void {
+  const assignments: string[] = ['status = ?'];
+  const values: unknown[] = [status];
+
+  if (patch?.attemptCount !== undefined) {
+    assignments.push('attempt_count = ?');
+    values.push(patch.attemptCount);
+  }
+
+  if (patch?.nextRetryAt !== undefined) {
+    assignments.push('next_retry_at = ?');
+    values.push(patch.nextRetryAt);
+  }
+
+  if (patch?.lastAttemptAt !== undefined) {
+    assignments.push('last_attempted_at = ?');
+    values.push(patch.lastAttemptAt);
+  }
+
+  if (patch?.lastError !== undefined) {
+    assignments.push('error_log = ?');
+    values.push(patch.lastError ? JSON.stringify(patch.lastError) : null);
+  }
+
+  if (patch?.retryPolicy !== undefined || patch?.retryBackoff !== undefined) {
+    const existing = db
+      .prepare('SELECT retry_policy FROM dead_letter_records WHERE id = ?')
+      .get(id) as { retry_policy: string } | undefined;
+
+    const stored = existing
+      ? parseRetryPolicy(existing.retry_policy)
+      : {
+          policy: { kind: 'bounded' as const, maxAttempts: 1 },
+          backoff: DEFAULT_RETRY_BACKOFF,
+        };
+
+    assignments.push('retry_policy = ?');
+    values.push(
+      serializeRetryPolicyValue(
+        patch.retryPolicy ?? stored.policy,
+        patch.retryBackoff ?? stored.backoff,
+      ),
+    );
+  }
+
+  if (patch?.event?.targetUrl !== undefined) {
+    assignments.push('endpoint_url = ?');
+    values.push(patch.event.targetUrl);
+  }
+
+  if (patch?.event?.method !== undefined) {
+    assignments.push('http_method = ?');
+    values.push(patch.event.method);
+  }
+
+  if (patch?.event?.body !== undefined) {
+    assignments.push('payload = ?');
+    values.push(patch.event.body);
+  }
+
+  if (patch?.event?.headers !== undefined) {
+    assignments.push('headers = ?');
+    values.push(JSON.stringify(patch.event.headers));
+  }
+
+  values.push(id);
+
+  db.prepare(
+    `UPDATE dead_letter_records SET ${assignments.join(', ')} WHERE id = ?`,
+  ).run(...values);
+}
+
+export function getRetryQueue(limit = 50): DeadLetterRecord[] {
+  const rows = getRetryQueueStmt.all(limit) as RetryQueueRow[];
+  return rows.map(rowToRecordFromRetryQueue);
+}
+
+export function getDeadLetters(cursor?: string, limit = 50): DeadLetterRecord[] {
+  const cursorValue = cursor ?? null;
+  const rows = getDeadLettersStmt.all(cursorValue, cursorValue, limit) as DbRow[];
+  return rows.map(rowToRecord);
+}
+
+export function getRecordById(id: string): DeadLetterRecord | null {
+  const row = db
+    .prepare('SELECT * FROM dead_letter_records WHERE id = ?')
+    .get(id) as DbRow | undefined;
+
+  if (!row) {
+    return null;
+  }
+
+  return rowToRecord(row);
+}
+
+export { db };
+
+```
+
+# src/db/schema.sql
+
+```sql
+CREATE TABLE IF NOT EXISTS dead_letter_records (
+  id TEXT PRIMARY KEY,
+  endpoint_url TEXT NOT NULL,
+  http_method TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  headers TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING',
+  retry_policy TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_attempted_at TEXT,
+  next_retry_at TEXT,
+  created_at TEXT NOT NULL,
+  error_log TEXT
+);
+PRAGMA journal_mode=WAL;
+CREATE INDEX IF NOT EXISTS idx_retry_queue
+  ON dead_letter_records(status, next_retry_at);
+
+```
+
+# src/engine/backoff.ts
+
+```ts
+import type { RetryBackoffConfig, RetryPolicy } from '../types';
+
+/** Unexported so tests can mock via `vi.spyOn` on this module's internals. */
+function randomBetween(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/**
+ * Computes the delay before the next delivery attempt.
+ *
+ * @returns milliseconds to wait before next attempt,
+ *          or -1 if the record should be marked DEAD
+ */
+export function calculateBackoffMs(
+  attempt: number,
+  policy: RetryPolicy,
+  backoff: RetryBackoffConfig,
+): number {
+  if (policy.kind === 'bounded' && attempt >= policy.maxAttempts) {
+    return -1;
+  }
+
+  if (policy.kind === 'ttl' && Date.now() > policy.expiresAt.getTime()) {
+    return -1;
+  }
+
+  const cappedDelay = Math.min(
+    backoff.maxDelayMs,
+    backoff.baseDelayMs * backoff.backoffMultiplier ** attempt,
+  );
+  const delay = randomBetween(0, cappedDelay);
+
+  if (policy.kind === 'ttl') {
+    if (Date.now() + delay > policy.expiresAt.getTime()) {
+      return 0;
+    }
+  }
+
+  return delay;
+}
+
+```
+
+# src/engine/replayEngine.ts
+
+```ts
+import { getRetryQueue, updateStatus } from '../db/client';
+import type { DeadLetterRecord, DeliveryError } from '../types';
+import { calculateBackoffMs } from './backoff';
+
+function buildDeliveryError(
+  code: string,
+  message: string,
+  retryable: boolean,
+  httpStatus?: number,
+): DeliveryError {
+  return {
+    code,
+    message,
+    httpStatus,
+    retryable,
+    occurredAt: new Date().toISOString(),
+  };
+}
+
+function headersToFetchInit(
+  headers: DeadLetterRecord['event']['headers'],
+): Record<string, string> {
+  const result: Record<string, string> = {};
+
+  for (const [key, value] of Object.entries(headers)) {
+    result[key] = Array.isArray(value) ? value.join(', ') : value;
+  }
+
+  return result;
+}
+
+function nextRetryAtFromDelayMs(delayMs: number): string {
+  return new Date(Date.now() + delayMs).toISOString();
+}
+
+function nextRetryAtFromRetryAfterSeconds(seconds: number): string {
+  return new Date(Date.now() + seconds * 1_000).toISOString();
+}
+
+export class ReplayEngine {
+  private processing = false;
+  private timer: NodeJS.Timeout | null = null;
+  private stopped = false;
+
+  constructor(private readonly pollIntervalMs: number) {}
+
+  start(): void {
+    this.stopped = false;
+    this.scheduleNext();
+  }
+
+  stop(): void {
+    this.stopped = true;
+
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private scheduleNext(): void {
+    if (this.stopped) {
+      return;
+    }
+
+    this.timer = setTimeout(() => {
+      void this._processBatch();
+    }, this.pollIntervalMs);
+  }
+
+  async _processBatch(): Promise<void> {
+    if (this.processing) {
+      return;
+    }
+
+    this.processing = true;
+
+    try {
+      const records = getRetryQueue(50);
+
+      for (const record of records) {
+        await this.processRecord(record);
+      }
+    } finally {
+      this.processing = false;
+      this.scheduleNext();
+    }
+  }
+
+  private async processRecord(record: DeadLetterRecord): Promise<void> {
+    const now = new Date().toISOString();
+
+    try {
+      const response = await fetch(record.event.targetUrl, {
+        method: record.event.method,
+        headers: headersToFetchInit(record.event.headers),
+        body: record.event.body,
+      });
+
+      if (response.status >= 200 && response.status < 300) {
+        updateStatus(record.id, 'DELIVERED', {
+          lastAttemptAt: now,
+        });
+        return;
+      }
+
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After');
+        const retryAfterSeconds =
+          retryAfter !== null && retryAfter !== '' && !Number.isNaN(Number(retryAfter))
+            ? Number(retryAfter)
+            : null;
+
+        const nextRetryAt =
+          retryAfterSeconds !== null
+            ? nextRetryAtFromRetryAfterSeconds(retryAfterSeconds)
+            : nextRetryAtFromDelayMs(
+                calculateBackoffMs(
+                  record.attemptCount,
+                  record.retryPolicy,
+                  record.retryBackoff,
+                ),
+              );
+
+        updateStatus(record.id, 'RETRYING', {
+          nextRetryAt,
+          lastAttemptAt: now,
+          lastError: buildDeliveryError(
+            'RATE_LIMITED',
+            `Target returned HTTP 429`,
+            true,
+            429,
+          ),
+        });
+        return;
+      }
+
+      await this.handleFailure(
+        record,
+        now,
+        buildDeliveryError(
+          'HTTP_ERROR',
+          `Target returned HTTP ${response.status}`,
+          true,
+          response.status,
+        ),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Network request failed';
+
+      await this.handleFailure(
+        record,
+        now,
+        buildDeliveryError('NETWORK_ERROR', message, true),
+      );
+    }
+  }
+
+  private async handleFailure(
+    record: DeadLetterRecord,
+    now: string,
+    lastError: DeliveryError,
+  ): Promise<void> {
+    const nextAttemptCount = record.attemptCount + 1;
+    const delayMs = calculateBackoffMs(
+      nextAttemptCount,
+      record.retryPolicy,
+      record.retryBackoff,
+    );
+
+    if (delayMs === -1) {
+      updateStatus(record.id, 'DEAD', {
+        lastError,
+        lastAttemptAt: now,
+      });
+      return;
+    }
+
+    updateStatus(record.id, 'RETRYING', {
+      attemptCount: nextAttemptCount,
+      nextRetryAt: nextRetryAtFromDelayMs(delayMs),
+      lastAttemptAt: now,
+      lastError,
+    });
+  }
+}
+
+```
+
+# src/index.ts
+
+```ts
+import { buildServer } from './api/server';
+import { ReplayEngine } from './engine/replayEngine';
+
+const PORT = Number.parseInt(process.env.PORT ?? '3000', 10);
+const POLL_INTERVAL_MS = Number.parseInt(process.env.POLL_INTERVAL_MS ?? '5000', 10);
+
+async function main(): Promise<void> {
+  const server = buildServer();
+  const engine = new ReplayEngine(POLL_INTERVAL_MS);
+
+  await server.listen({ port: PORT, host: '0.0.0.0' });
+  engine.start();
+
+  const shutdown = async (signal: string): Promise<void> => {
+    server.log.info({ signal }, 'shutting down');
+    engine.stop();
+    await server.close();
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => {
+    void shutdown('SIGINT');
+  });
+
+  process.on('SIGTERM', () => {
+    void shutdown('SIGTERM');
+  });
+}
+
+void main();
+
+```
+
 # src/types.ts
 
 ```ts
@@ -295,6 +1143,63 @@ export interface StatusLifecycleEvent {
   attemptCount: number;
   timestamp: ISOTimestamp;
   metadata?: Record<string, unknown>;
+}
+
+```
+
+# src/validators/webhookPayload.ts
+
+```ts
+import { z } from 'zod';
+
+import type { RetryPolicy } from '../types';
+
+const boundedRetryPolicySchema = z.object({
+  kind: z.literal('bounded'),
+  maxAttempts: z.number().int().positive(),
+});
+
+const ttlRetryPolicySchema = z.object({
+  kind: z.literal('ttl'),
+  expiresAt: z.coerce.date(),
+});
+
+export const retryPolicySchema: z.ZodType<RetryPolicy> = z.discriminatedUnion(
+  'kind',
+  [boundedRetryPolicySchema, ttlRetryPolicySchema],
+);
+
+export const webhookPayloadSchema = z.object({
+  endpoint_url: z.string().min(1).url(),
+  http_method: z.enum(['POST', 'PUT', 'PATCH']),
+  payload: z.object({}).passthrough(),
+  headers: z.object({}).passthrough().optional().default({}),
+  retry_policy: retryPolicySchema,
+});
+
+export type WebhookPayload = z.infer<typeof webhookPayloadSchema>;
+
+```
+
+# tsconfig.json
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "CommonJS",
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "declaration": true,
+    "declarationMap": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
 }
 
 ```

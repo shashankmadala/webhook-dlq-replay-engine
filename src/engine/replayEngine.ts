@@ -46,7 +46,7 @@ export class ReplayEngine {
 
   start(): void {
     this.stopped = false;
-    void this._processBatch().then(() => this.scheduleNext());
+    this.scheduleNext();
   }
 
   stop(): void {
@@ -64,7 +64,7 @@ export class ReplayEngine {
     }
 
     this.timer = setTimeout(() => {
-      void this._processBatch().then(() => this.scheduleNext());
+      void this._processBatch();
     }, this.pollIntervalMs);
   }
 
@@ -83,6 +83,7 @@ export class ReplayEngine {
       }
     } finally {
       this.processing = false;
+      this.scheduleNext();
     }
   }
 
@@ -160,8 +161,9 @@ export class ReplayEngine {
     now: string,
     lastError: DeliveryError,
   ): Promise<void> {
+    const nextAttemptCount = record.attemptCount + 1;
     const delayMs = calculateBackoffMs(
-      record.attemptCount,
+      nextAttemptCount,
       record.retryPolicy,
       record.retryBackoff,
     );
@@ -175,7 +177,7 @@ export class ReplayEngine {
     }
 
     updateStatus(record.id, 'RETRYING', {
-      attemptCount: record.attemptCount + 1,
+      attemptCount: nextAttemptCount,
       nextRetryAt: nextRetryAtFromDelayMs(delayMs),
       lastAttemptAt: now,
       lastError,
