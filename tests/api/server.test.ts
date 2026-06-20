@@ -5,7 +5,7 @@ vi.hoisted(() => {
 });
 
 import { buildServer } from '../../src/api/server';
-import { db, insertRecord } from '../../src/db/client';
+import { db, getRecordById, insertRecord } from '../../src/db/client';
 import type { DeadLetterRecord, RetryBackoffConfig } from '../../src/types';
 
 const DEFAULT_RETRY_BACKOFF: RetryBackoffConfig = {
@@ -38,6 +38,33 @@ function createRecord(id: string): DeadLetterRecord {
     createdAt: now,
     updatedAt: now,
     finalizedAt: null,
+  };
+}
+
+function createDeadRecord(
+  id: string,
+  targetUrl = 'https://example.com/webhook',
+): DeadLetterRecord {
+  const record = createRecord(id);
+  const now = new Date().toISOString();
+
+  return {
+    ...record,
+    event: {
+      ...record.event,
+      targetUrl,
+    },
+    status: 'DEAD',
+    attemptCount: 3,
+    nextRetryAt: now,
+    lastAttemptAt: now,
+    lastError: {
+      code: 'MAX_ATTEMPTS',
+      message: 'Exceeded max attempts',
+      retryable: false,
+      occurredAt: now,
+    },
+    finalizedAt: now,
   };
 }
 
@@ -103,6 +130,63 @@ describe('API server', () => {
       expect(response.json()).toMatchObject({
         status: 'ok',
         db: 'connected',
+      });
+    });
+  });
+
+  describe('POST /webhooks/replay/bulk', () => {
+    it('requeues matching DEAD records up to limit', async () => {
+      insertRecord(createDeadRecord('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
+      insertRecord(createDeadRecord('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'));
+
+      const response = await server.inject({
+        method: 'POST',
+        url: '/webhooks/replay/bulk',
+        payload: {
+          limit: 1,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        requeued: 1,
+        ids: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+      });
+
+      const requeued = getRecordById('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+      expect(requeued?.status).toBe('PENDING');
+      expect(requeued?.nextRetryAt).toBeNull();
+      expect(requeued?.lastError).toBeNull();
+    });
+
+    it('filters by endpoint_url using LIKE match', async () => {
+      insertRecord(
+        createDeadRecord(
+          'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          'https://example.com/webhook',
+        ),
+      );
+      insertRecord(
+        createDeadRecord(
+          'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          'https://other.example.com/webhook',
+        ),
+      );
+
+      const response = await server.inject({
+        method: 'POST',
+        url: '/webhooks/replay/bulk',
+        payload: {
+          filter: {
+            endpoint_url: 'https://example.com/webhook',
+          },
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        requeued: 1,
+        ids: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
       });
     });
   });

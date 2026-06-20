@@ -3,13 +3,19 @@ import { v4 as uuidv4 } from 'uuid';
 
 import {
   db,
+  getBulkReplayTargets,
   getDeadLetters,
   getMetrics,
   getRecordById,
   insertRecord,
   updateStatus,
 } from '../db/client';
-import type { DeadLetterRecord, HttpHeaders, RetryBackoffConfig } from '../types';
+import type {
+  DeadLetterRecord,
+  DLQStatus,
+  HttpHeaders,
+  RetryBackoffConfig,
+} from '../types';
 import { webhookPayloadSchema } from '../validators/webhookPayload';
 
 const DEFAULT_RETRY_BACKOFF: RetryBackoffConfig = {
@@ -95,6 +101,43 @@ export function buildServer() {
     return reply.send({
       records,
       nextCursor,
+    });
+  });
+
+  server.post<{
+    Body: {
+      filter?: {
+        status?: DLQStatus;
+        endpoint_url?: string;
+      };
+      limit?: number;
+    };
+  }>('/webhooks/replay/bulk', async (request, reply) => {
+    const filter = request.body?.filter ?? {};
+    const status = filter.status ?? 'DEAD';
+    const endpointUrl = filter.endpoint_url;
+
+    let limit = request.body?.limit ?? 50;
+    if (typeof limit !== 'number' || Number.isNaN(limit)) {
+      limit = 50;
+    } else {
+      limit = Math.min(Math.max(limit, 1), 200);
+    }
+
+    const records = getBulkReplayTargets(status, endpointUrl, limit);
+    const ids: string[] = [];
+
+    for (const record of records) {
+      updateStatus(record.id, 'PENDING', {
+        nextRetryAt: null,
+        lastError: null,
+      });
+      ids.push(record.id);
+    }
+
+    return reply.send({
+      requeued: ids.length,
+      ids,
     });
   });
 

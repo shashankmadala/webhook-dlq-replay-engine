@@ -104,6 +104,15 @@ const getDeadLettersStmt = db.prepare(`
   LIMIT ?
 `);
 
+const getBulkReplayTargetsStmt = db.prepare(`
+  SELECT *
+  FROM dead_letter_records
+  WHERE status = ?
+    AND (? IS NULL OR endpoint_url LIKE ?)
+  ORDER BY created_at ASC
+  LIMIT ?
+`);
+
 interface MetricsRow {
   total: number;
   pending: number | null;
@@ -349,6 +358,21 @@ export function getRetryQueue(limit = 50): DeadLetterRecord[] {
 export function getDeadLetters(cursor?: string, limit = 50): DeadLetterRecord[] {
   const cursorValue = cursor ?? null;
   const rows = getDeadLettersStmt.all(cursorValue, cursorValue, limit) as DbRow[];
+  return rows.map(rowToRecord);
+}
+
+export function getBulkReplayTargets(
+  status: DLQStatus,
+  endpointUrl?: string,
+  limit = 50,
+): DeadLetterRecord[] {
+  const endpointFilter = endpointUrl ?? null;
+  const rows = getBulkReplayTargetsStmt.all(
+    status,
+    endpointFilter,
+    endpointFilter,
+    limit,
+  ) as DbRow[];
   return rows.map(rowToRecord);
 }
 
