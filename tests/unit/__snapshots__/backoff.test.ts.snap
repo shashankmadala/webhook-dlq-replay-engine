@@ -1,0 +1,13 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`calculateBackoffMs > deterministic snapshot > locks the backoff curve for attempts 0-6 with bounded maxAttempts 10 1`] = `
+[
+  500,
+  1000,
+  2000,
+  4000,
+  8000,
+  16000,
+  32000,
+]
+`;

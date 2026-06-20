@@ -12,7 +12,7 @@ import type {
   RetryPolicy,
 } from '../types';
 
-const DB_PATH = 'dlq.db';
+const DB_PATH = process.env.DB_PATH ?? 'dlq.db';
 const SCHEMA_PATH = path.join(__dirname, 'schema.sql');
 const DEFAULT_RETRY_BACKOFF: RetryBackoffConfig = {
   baseDelayMs: 1_000,
