@@ -2,3 +2,6 @@ node_modules/
 dist/
 dlq.db
 *.js.map
+
+# macOS
+.DS_Store
