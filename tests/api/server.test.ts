@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const lookupSyncMock = vi.hoisted(() =>
-  vi.fn(() => ({ address: '93.184.216.34', family: 4 })),
+const lookupMock = vi.hoisted(() =>
+  vi.fn((_hostname?: string, _options?: unknown) => ({
+    address: '93.184.216.34',
+    family: 4,
+  })),
 );
 
 vi.hoisted(() => {
@@ -9,7 +12,10 @@ vi.hoisted(() => {
 });
 
 vi.mock('node:dns', () => ({
-  lookupSync: (...args: unknown[]) => lookupSyncMock(...args),
+  promises: {
+    lookup: (hostname: string, options?: unknown) =>
+      lookupMock(hostname, options),
+  },
 }));
 
 import { buildServer } from '../../src/api/server';
@@ -80,7 +86,7 @@ describe('API server', () => {
   let server: ReturnType<typeof buildServer>;
 
   beforeEach(async () => {
-    lookupSyncMock.mockReturnValue({ address: '93.184.216.34', family: 4 });
+    lookupMock.mockReturnValue({ address: '93.184.216.34', family: 4 });
     db.exec('DELETE FROM dead_letter_records');
     server = buildServer();
     await server.ready();
@@ -88,7 +94,7 @@ describe('API server', () => {
 
   afterEach(async () => {
     await server.close();
-    lookupSyncMock.mockReset();
+    lookupMock.mockReset();
   });
 
   describe('POST /webhooks/ingest', () => {

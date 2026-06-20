@@ -1,4 +1,4 @@
-import { lookupSync } from 'node:dns';
+import { promises as dns } from 'node:dns';
 import { isIP } from 'node:net';
 
 export class SsrfBlockedError extends Error {
@@ -85,16 +85,16 @@ function isBlockedIp(address: string): boolean {
   return true;
 }
 
-function resolveHostname(hostname: string): string | null {
+async function resolveHostname(hostname: string): Promise<string | null> {
   try {
-    const { address } = lookupSync(hostname, { verbatim: true });
+    const { address } = await dns.lookup(hostname, { verbatim: true });
     return address;
   } catch {
     return null;
   }
 }
 
-export function isSafeUrl(url: string): boolean {
+export async function isSafeUrl(url: string): Promise<boolean> {
   let parsed: URL;
 
   try {
@@ -117,7 +117,7 @@ export function isSafeUrl(url: string): boolean {
     return !isBlockedIp(hostname);
   }
 
-  const resolved = resolveHostname(hostname);
+  const resolved = await resolveHostname(hostname);
   if (resolved === null) {
     return false;
   }
@@ -126,7 +126,7 @@ export function isSafeUrl(url: string): boolean {
 }
 
 export async function assertSafeUrl(url: string): Promise<void> {
-  if (!isSafeUrl(url)) {
+  if (!(await isSafeUrl(url))) {
     throw new SsrfBlockedError(url);
   }
 }

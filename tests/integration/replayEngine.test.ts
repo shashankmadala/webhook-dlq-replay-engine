@@ -3,8 +3,11 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const lookupSyncMock = vi.hoisted(() =>
-  vi.fn(() => ({ address: '93.184.216.34', family: 4 })),
+const lookupMock = vi.hoisted(() =>
+  vi.fn((_hostname?: string, _options?: unknown) => ({
+    address: '93.184.216.34',
+    family: 4,
+  })),
 );
 
 vi.hoisted(() => {
@@ -12,7 +15,10 @@ vi.hoisted(() => {
 });
 
 vi.mock('node:dns', () => ({
-  lookupSync: (...args: unknown[]) => lookupSyncMock(...args),
+  promises: {
+    lookup: (hostname: string, options?: unknown) =>
+      lookupMock(hostname, options),
+  },
 }));
 
 import { db, getRecordById, insertRecord } from '../../src/db/client';
@@ -86,7 +92,7 @@ describe('ReplayEngine integration', () => {
     db.exec(schemaSql);
     db.exec('DELETE FROM dead_letter_records');
 
-    lookupSyncMock.mockReturnValue({ address: '93.184.216.34', family: 4 });
+    lookupMock.mockReturnValue({ address: '93.184.216.34', family: 4 });
 
     mockFetch = vi.fn(async (url: string) => {
       if (url === URL_2XX) {
@@ -111,7 +117,7 @@ describe('ReplayEngine integration', () => {
   afterEach(() => {
     engine.stop();
     vi.unstubAllGlobals();
-    lookupSyncMock.mockReset();
+    lookupMock.mockReset();
   });
 
   it('processes 2xx, 5xx, and network error records in one batch', async () => {

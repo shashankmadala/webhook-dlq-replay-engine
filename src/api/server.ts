@@ -115,7 +115,7 @@ export function buildServer() {
       });
     }
 
-    if (!isSafeUrl(parsed.data.endpoint_url)) {
+    if (!(await isSafeUrl(parsed.data.endpoint_url))) {
       return reply.status(400).send({
         error: 'SSRF_BLOCKED_URL',
         message: 'The endpoint URL resolves to a blocked IP range',
