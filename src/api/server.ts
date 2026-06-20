@@ -1,7 +1,14 @@
 import Fastify from 'fastify';
 import { v4 as uuidv4 } from 'uuid';
 
-import { db, getDeadLetters, getRecordById, insertRecord, updateStatus } from '../db/client';
+import {
+  db,
+  getDeadLetters,
+  getMetrics,
+  getRecordById,
+  insertRecord,
+  updateStatus,
+} from '../db/client';
 import type { DeadLetterRecord, HttpHeaders, RetryBackoffConfig } from '../types';
 import { webhookPayloadSchema } from '../validators/webhookPayload';
 
@@ -111,6 +118,21 @@ export function buildServer() {
       });
     },
   );
+
+  server.get('/metrics', async (_request, reply) => {
+    const { summary, oldest_pending_at } = getMetrics();
+    const dead_rate_pct =
+      summary.total > 0
+        ? Math.round((summary.dead / summary.total) * 1000) / 10
+        : 0;
+
+    return reply.send({
+      summary,
+      oldest_pending_at,
+      dead_rate_pct,
+      uptime_seconds: process.uptime(),
+    });
+  });
 
   server.get('/health', async (_request, reply) => {
     try {

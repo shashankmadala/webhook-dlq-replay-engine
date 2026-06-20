@@ -104,6 +104,26 @@ const getDeadLettersStmt = db.prepare(`
   LIMIT ?
 `);
 
+interface MetricsRow {
+  total: number;
+  pending: number | null;
+  retrying: number | null;
+  delivered: number | null;
+  dead: number | null;
+  oldest_pending_at: string | null;
+}
+
+const getMetricsStmt = db.prepare(`
+  SELECT
+    COUNT(*) as total,
+    SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) as pending,
+    SUM(CASE WHEN status = 'RETRYING' THEN 1 ELSE 0 END) as retrying,
+    SUM(CASE WHEN status = 'DELIVERED' THEN 1 ELSE 0 END) as delivered,
+    SUM(CASE WHEN status = 'DEAD' THEN 1 ELSE 0 END) as dead,
+    MIN(CASE WHEN status = 'PENDING' THEN created_at END) as oldest_pending_at
+  FROM dead_letter_records
+`);
+
 function serializeRetryPolicyValue(
   policy: RetryPolicy,
   backoff: RetryBackoffConfig,
@@ -342,6 +362,30 @@ export function getRecordById(id: string): DeadLetterRecord | null {
   }
 
   return rowToRecord(row);
+}
+
+export function getMetrics(): {
+  summary: {
+    total: number;
+    pending: number;
+    retrying: number;
+    delivered: number;
+    dead: number;
+  };
+  oldest_pending_at: string | null;
+} {
+  const row = getMetricsStmt.get() as MetricsRow;
+
+  return {
+    summary: {
+      total: row.total,
+      pending: row.pending ?? 0,
+      retrying: row.retrying ?? 0,
+      delivered: row.delivered ?? 0,
+      dead: row.dead ?? 0,
+    },
+    oldest_pending_at: row.oldest_pending_at,
+  };
 }
 
 export { db };
