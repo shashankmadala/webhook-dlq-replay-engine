@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import Database from 'better-sqlite3';
+import Database, { type Database as DatabaseInstance } from 'better-sqlite3';
 
 import type {
   DeadLetterRecord,
@@ -56,7 +56,7 @@ interface StoredRetryPolicy {
   backoff: RetryBackoffConfig;
 }
 
-const db = new Database(DB_PATH);
+const db: DatabaseInstance = new Database(DB_PATH);
 
 const schemaSql = fs.readFileSync(SCHEMA_PATH, 'utf8');
 db.exec(schemaSql);
@@ -331,3 +331,17 @@ export function getDeadLetters(cursor?: string, limit = 50): DeadLetterRecord[] 
   const rows = getDeadLettersStmt.all(cursorValue, cursorValue, limit) as DbRow[];
   return rows.map(rowToRecord);
 }
+
+export function getRecordById(id: string): DeadLetterRecord | null {
+  const row = db
+    .prepare('SELECT * FROM dead_letter_records WHERE id = ?')
+    .get(id) as DbRow | undefined;
+
+  if (!row) {
+    return null;
+  }
+
+  return rowToRecord(row);
+}
+
+export { db };
