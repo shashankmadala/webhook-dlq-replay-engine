@@ -1,6 +1,10 @@
+import pino from 'pino';
+
 import { getRetryQueue, updateStatus } from '../db/client';
-import type { DeadLetterRecord, DeliveryError } from '../types';
+import type { DeadLetterRecord, DeliveryError, DLQStatus } from '../types';
 import { calculateBackoffMs } from './backoff';
+
+const logger = pino({ name: 'replay-engine' });
 
 function buildDeliveryError(
   code: string,
@@ -87,6 +91,24 @@ export class ReplayEngine {
     }
   }
 
+  private logTransition(
+    record: DeadLetterRecord,
+    from: DLQStatus,
+    to: DLQStatus,
+    meta?: Record<string, unknown>,
+  ): void {
+    logger.info({
+      event: 'dlq.status_transition',
+      recordId: record.id,
+      targetUrl: record.event.targetUrl,
+      from,
+      to,
+      attemptCount: record.attemptCount,
+      timestamp: new Date().toISOString(),
+      ...meta,
+    });
+  }
+
   private async processRecord(record: DeadLetterRecord): Promise<void> {
     const now = new Date().toISOString();
 
@@ -98,6 +120,7 @@ export class ReplayEngine {
       });
 
       if (response.status >= 200 && response.status < 300) {
+        this.logTransition(record, record.status, 'DELIVERED');
         updateStatus(record.id, 'DELIVERED', {
           lastAttemptAt: now,
         });
@@ -159,6 +182,9 @@ export class ReplayEngine {
     );
 
     if (delayMs === -1) {
+      this.logTransition(record, record.status, 'DEAD', {
+        errorCode: lastError.code,
+      });
       updateStatus(record.id, 'DEAD', {
         lastError,
         lastAttemptAt: now,
@@ -166,9 +192,11 @@ export class ReplayEngine {
       return;
     }
 
+    const nextRetryAt = nextRetryAtFromDelayMs(delayMs);
+    this.logTransition(record, record.status, 'RETRYING', { nextRetryAt });
     updateStatus(record.id, 'RETRYING', {
       attemptCount: nextAttemptCount,
-      nextRetryAt: nextRetryAtFromDelayMs(delayMs),
+      nextRetryAt,
       lastAttemptAt: now,
       lastError,
     });
