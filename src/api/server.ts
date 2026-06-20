@@ -51,13 +51,14 @@ export function buildServer() {
   });
 
   server.setErrorHandler((error, request, reply) => {
-    if (error.statusCode === 415) {
+    const err = error as { statusCode?: number; message?: string };
+    if (err.statusCode === 415) {
       return reply.status(415).send({ error: 'UNSUPPORTED_MEDIA_TYPE' });
     }
 
     request.log.error(error);
-    return reply.status(error.statusCode ?? 500).send({
-      error: error.message,
+    return reply.status(err.statusCode ?? 500).send({
+      error: err.message ?? 'Internal Server Error',
     });
   });
 

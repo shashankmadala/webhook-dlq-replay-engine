@@ -10,7 +10,8 @@
     "build": "tsc",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "load-test": "ts-node scripts/loadTest.ts"
   },
   "repository": {
     "type": "git",
