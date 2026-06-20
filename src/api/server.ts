@@ -30,6 +30,37 @@ export function buildServer() {
     logger: true,
   });
 
+  server.removeContentTypeParser('application/json');
+  server.addContentTypeParser(
+    'application/json',
+    { parseAs: 'string' },
+    (_request, body, done) => {
+      try {
+        done(null, JSON.parse(body as string));
+      } catch (error) {
+        done(error as Error, undefined);
+      }
+    },
+  );
+  server.addContentTypeParser('*', (_request, _payload, done) => {
+    const error = new Error('Unsupported Media Type') as Error & {
+      statusCode: number;
+    };
+    error.statusCode = 415;
+    done(error, undefined);
+  });
+
+  server.setErrorHandler((error, request, reply) => {
+    if (error.statusCode === 415) {
+      return reply.status(415).send({ error: 'UNSUPPORTED_MEDIA_TYPE' });
+    }
+
+    request.log.error(error);
+    return reply.status(error.statusCode ?? 500).send({
+      error: error.message,
+    });
+  });
+
   server.post('/webhooks/ingest', {
     onRequest(request, reply, done) {
       const log = request.log.child({ requestId: uuidv4() });
@@ -44,6 +75,14 @@ export function buildServer() {
       return reply.status(400).send({
         error: 'VALIDATION_FAILED',
         details: parsed.error.issues,
+      });
+    }
+
+    const payloadSize = Buffer.byteLength(JSON.stringify(parsed.data.payload));
+    if (payloadSize > 512 * 1024) {
+      return reply.status(413).send({
+        error: 'PAYLOAD_TOO_LARGE',
+        maxBytes: 512 * 1024,
       });
     }
 
