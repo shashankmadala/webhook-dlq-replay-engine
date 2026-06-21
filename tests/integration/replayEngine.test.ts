@@ -144,4 +144,54 @@ describe('ReplayEngine integration', () => {
     expect(mockFetch).toHaveBeenCalledTimes(SEEDED_RECORD_COUNT);
     expect(mockFetch).not.toHaveBeenCalledTimes(SEEDED_RECORD_COUNT * 2);
   });
+
+  it('atomic claiming prevents duplicate delivery across engine instances', async () => {
+    const id = '11111111-1111-4111-8111-111111111111';
+    insertRecord(createRecord(id, URL_2XX));
+    const secondEngine = new ReplayEngine(60_000);
+
+    try {
+      await Promise.all([engine._processBatch(), secondEngine._processBatch()]);
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const delivered = getRecordById(id);
+      expect(delivered?.status).toBe('DELIVERED');
+      expect(delivered?.claimToken).toBeNull();
+      expect(delivered?.claimedAt).toBeNull();
+    } finally {
+      secondEngine.stop();
+    }
+  });
+
+  it('defers claimed records when the circuit breaker is open', async () => {
+    const firstId = '11111111-1111-4111-8111-111111111111';
+    insertRecord({
+      ...createRecord(firstId, URL_5XX),
+      retryBackoff: {
+        ...RETRY_BACKOFF,
+        baseDelayMs: 0,
+        maxDelayMs: 0,
+      },
+    });
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await engine._processBatch();
+    }
+
+    mockFetch.mockClear();
+
+    const secondId = '22222222-2222-4222-8222-222222222222';
+    insertRecord(createRecord(secondId, URL_5XX));
+    const before = Date.now();
+
+    await engine._processBatch();
+
+    expect(mockFetch).not.toHaveBeenCalled();
+    const deferred = getRecordById(secondId);
+    expect(deferred?.status).toBe('RETRYING');
+    expect(deferred?.claimToken).toBeNull();
+    expect(deferred?.claimedAt).toBeNull();
+    expect(deferred?.nextRetryAt).not.toBeNull();
+    expect(Date.parse(deferred?.nextRetryAt ?? '')).toBeGreaterThan(before);
+  });
 });

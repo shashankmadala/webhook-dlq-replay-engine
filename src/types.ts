@@ -81,6 +81,8 @@ export interface DeadLetterRecord {
   retryPolicy: RetryPolicy;
   retryBackoff: RetryBackoffConfig;
   nextRetryAt: ISOTimestamp | null;
+  claimToken?: string | null;
+  claimedAt?: ISOTimestamp | null;
   lastAttemptAt: ISOTimestamp | null;
   lastError: DeliveryError | null;
   createdAt: ISOTimestamp;

@@ -32,19 +32,10 @@ interface DbRow {
   attempt_count: number;
   last_attempted_at: string | null;
   next_retry_at: string | null;
+  claim_token: string | null;
+  claimed_at: string | null;
   created_at: string;
   error_log: string | null;
-}
-
-interface RetryQueueRow {
-  id: string;
-  endpoint_url: string;
-  http_method: string;
-  payload: string;
-  headers: string;
-  retry_policy: string;
-  attempt_count: number;
-  next_retry_at: string | null;
 }
 
 type SerializedRetryPolicy =
@@ -61,6 +52,23 @@ const db: DatabaseInstance = new Database(DB_PATH);
 const schemaSql = fs.readFileSync(SCHEMA_PATH, 'utf8');
 db.exec(schemaSql);
 
+function ensureColumn(tableName: string, columnName: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{
+    name: string;
+  }>;
+
+  if (!columns.some((column) => column.name === columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
+ensureColumn('dead_letter_records', 'claim_token', 'TEXT');
+ensureColumn('dead_letter_records', 'claimed_at', 'TEXT');
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_retry_claims
+    ON dead_letter_records(status, next_retry_at, claimed_at)
+`);
+
 const insertRecordStmt = db.prepare(`
   INSERT INTO dead_letter_records (
     id,
@@ -73,26 +81,11 @@ const insertRecordStmt = db.prepare(`
     attempt_count,
     last_attempted_at,
     next_retry_at,
+    claim_token,
+    claimed_at,
     created_at,
     error_log
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const getRetryQueueStmt = db.prepare(`
-  SELECT
-    id,
-    endpoint_url,
-    http_method,
-    payload,
-    headers,
-    retry_policy,
-    attempt_count,
-    next_retry_at
-  FROM dead_letter_records
-  WHERE (status = 'PENDING' OR status = 'RETRYING')
-    AND (next_retry_at IS NULL OR next_retry_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-  ORDER BY next_retry_at ASC, created_at ASC
-  LIMIT ?
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const getDeadLettersStmt = db.prepare(`
@@ -223,37 +216,13 @@ function rowToRecord(row: DbRow): DeadLetterRecord {
     retryPolicy: policy,
     retryBackoff: backoff,
     nextRetryAt: row.next_retry_at,
+    claimToken: row.claim_token,
+    claimedAt: row.claimed_at,
     lastAttemptAt: row.last_attempted_at,
     lastError: parseErrorLog(row.error_log),
     createdAt: row.created_at,
     updatedAt: row.created_at,
     finalizedAt,
-  };
-}
-
-function rowToRecordFromRetryQueue(row: RetryQueueRow): DeadLetterRecord {
-  const { policy, backoff } = parseRetryPolicy(row.retry_policy);
-
-  return {
-    id: row.id,
-    event: {
-      id: row.id,
-      targetUrl: row.endpoint_url,
-      method: row.http_method as HttpMethod,
-      headers: parseHeaders(row.headers),
-      body: row.payload,
-      receivedAt: row.next_retry_at ?? new Date().toISOString(),
-    },
-    status: 'PENDING',
-    attemptCount: row.attempt_count,
-    retryPolicy: policy,
-    retryBackoff: backoff,
-    nextRetryAt: row.next_retry_at,
-    lastAttemptAt: null,
-    lastError: null,
-    createdAt: row.next_retry_at ?? new Date().toISOString(),
-    updatedAt: row.next_retry_at ?? new Date().toISOString(),
-    finalizedAt: null,
   };
 }
 
@@ -269,16 +238,19 @@ export function insertRecord(record: DeadLetterRecord): void {
     record.attemptCount,
     record.lastAttemptAt,
     record.nextRetryAt,
+    record.claimToken ?? null,
+    record.claimedAt ?? null,
     record.createdAt,
     record.lastError ? JSON.stringify(record.lastError) : null,
   );
 }
 
-export function updateStatus(
+function applyStatusUpdate(
   id: string,
   status: DeadLetterRecord['status'],
   patch?: Partial<DeadLetterRecord>,
-): void {
+  claimToken?: string,
+): number {
   const assignments: string[] = ['status = ?'];
   const values: unknown[] = [status];
 
@@ -290,6 +262,16 @@ export function updateStatus(
   if (patch?.nextRetryAt !== undefined) {
     assignments.push('next_retry_at = ?');
     values.push(patch.nextRetryAt);
+  }
+
+  if (patch?.claimToken !== undefined) {
+    assignments.push('claim_token = ?');
+    values.push(patch.claimToken);
+  }
+
+  if (patch?.claimedAt !== undefined) {
+    assignments.push('claimed_at = ?');
+    values.push(patch.claimedAt);
   }
 
   if (patch?.lastAttemptAt !== undefined) {
@@ -345,14 +327,89 @@ export function updateStatus(
 
   values.push(id);
 
-  db.prepare(
-    `UPDATE dead_letter_records SET ${assignments.join(', ')} WHERE id = ?`,
-  ).run(...values);
+  const claimGuard = claimToken === undefined ? '' : ' AND claim_token = ?';
+  if (claimToken !== undefined) {
+    values.push(claimToken);
+  }
+
+  const result = db
+    .prepare(
+      `UPDATE dead_letter_records SET ${assignments.join(', ')} WHERE id = ?${claimGuard}`,
+    )
+    .run(...values);
+
+  return result.changes;
 }
 
-export function getRetryQueue(limit = 50): DeadLetterRecord[] {
-  const rows = getRetryQueueStmt.all(limit) as RetryQueueRow[];
-  return rows.map(rowToRecordFromRetryQueue);
+const claimDueRecordsStmt = db.prepare(`
+  UPDATE dead_letter_records
+  SET status = 'RETRYING',
+      claim_token = ?,
+      claimed_at = ?
+  WHERE id IN (
+    SELECT id
+    FROM dead_letter_records
+    WHERE (status = 'PENDING' OR status = 'RETRYING')
+      AND (next_retry_at IS NULL OR next_retry_at <= ?)
+      AND (claim_token IS NULL OR claimed_at IS NULL OR claimed_at <= ?)
+    ORDER BY next_retry_at ASC, created_at ASC
+    LIMIT ?
+  )
+  RETURNING *
+`);
+
+export function claimDueRecords(
+  limit: number,
+  claimToken: string,
+  staleClaimCutoff: string,
+): DeadLetterRecord[] {
+  const now = new Date().toISOString();
+  const rows = claimDueRecordsStmt.all(
+    claimToken,
+    now,
+    now,
+    staleClaimCutoff,
+    limit,
+  ) as DbRow[];
+
+  return rows.map(rowToRecord);
+}
+
+export function updateClaimedStatus(
+  id: string,
+  claimToken: string,
+  status: DeadLetterRecord['status'],
+  patch?: Partial<DeadLetterRecord>,
+): boolean {
+  const claimedPatch: Partial<DeadLetterRecord> = {
+    ...patch,
+    claimToken: null,
+    claimedAt: null,
+  };
+
+  return applyStatusUpdate(id, status, claimedPatch, claimToken) > 0;
+}
+
+export function requeueRecordForReplay(
+  id: string,
+  staleClaimCutoff: string,
+): boolean {
+  const result = db
+    .prepare(
+      `
+        UPDATE dead_letter_records
+        SET status = 'PENDING',
+            next_retry_at = NULL,
+            error_log = NULL,
+            claim_token = NULL,
+            claimed_at = NULL
+        WHERE id = ?
+          AND (claim_token IS NULL OR claimed_at IS NULL OR claimed_at <= ?)
+      `,
+    )
+    .run(id, staleClaimCutoff);
+
+  return result.changes > 0;
 }
 
 export function getDeadLetters(cursor?: string, limit = 50): DeadLetterRecord[] {

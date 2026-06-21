@@ -9,8 +9,9 @@ import {
   getRecordById,
   insertRecord,
   listRecords,
-  updateStatus,
+  requeueRecordForReplay,
 } from '../db/client';
+import { staleClaimCutoff } from '../engine/claiming';
 import type {
   DeadLetterRecord,
   DLQStatus,
@@ -247,11 +248,9 @@ export function buildServer() {
     const ids: string[] = [];
 
     for (const record of records) {
-      updateStatus(record.id, 'PENDING', {
-        nextRetryAt: null,
-        lastError: null,
-      });
-      ids.push(record.id);
+      if (requeueRecordForReplay(record.id, staleClaimCutoff())) {
+        ids.push(record.id);
+      }
     }
 
     return reply.send({
@@ -269,14 +268,15 @@ export function buildServer() {
         return reply.status(404).send({ error: 'NOT_FOUND' });
       }
 
-      updateStatus(record.id, 'RETRYING', {
-        nextRetryAt: new Date().toISOString(),
-      });
+      const requeued = requeueRecordForReplay(record.id, staleClaimCutoff());
 
       return reply.send({
         id: record.id,
-        status: 'RETRYING',
-        message: 'Record queued for immediate replay',
+        status: requeued ? 'PENDING' : record.status,
+        message: requeued
+          ? 'Record queued for immediate replay'
+          : 'Record already has an active replay claim',
+        requeued,
       });
     },
   );

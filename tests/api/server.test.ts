@@ -19,7 +19,12 @@ vi.mock('node:dns', () => ({
 }));
 
 import { buildServer } from '../../src/api/server';
-import { db, getRecordById, insertRecord } from '../../src/db/client';
+import {
+  claimDueRecords,
+  db,
+  getRecordById,
+  insertRecord,
+} from '../../src/db/client';
 import type { DeadLetterRecord, RetryBackoffConfig } from '../../src/types';
 
 const DEFAULT_RETRY_BACKOFF: RetryBackoffConfig = {
@@ -299,6 +304,29 @@ describe('API server', () => {
         ],
       });
     });
+
+    it('does not requeue actively claimed records in bulk replay', async () => {
+      const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      insertRecord(createRecord(id));
+      claimDueRecords(1, 'active-claim', '1970-01-01T00:00:00.000Z');
+
+      const response = await server.inject({
+        method: 'POST',
+        url: '/webhooks/replay/bulk',
+        payload: {
+          filter: {
+            status: 'RETRYING',
+          },
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        requeued: 0,
+        ids: [],
+      });
+      expect(getRecordById(id)?.claimToken).toBe('active-claim');
+    });
   });
 
   describe('GET /webhooks/records', () => {
@@ -508,7 +536,7 @@ describe('API server', () => {
   });
 
   describe('POST /webhooks/replay/:id', () => {
-    it('returns 200 RETRYING for an existing record', async () => {
+    it('returns 200 and requeues an existing record', async () => {
       const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
       insertRecord(createRecord(id));
 
@@ -520,9 +548,30 @@ describe('API server', () => {
       expect(response.statusCode).toBe(200);
       expect(response.json()).toMatchObject({
         id,
-        status: 'RETRYING',
+        status: 'PENDING',
         message: 'Record queued for immediate replay',
+        requeued: true,
       });
+    });
+
+    it('does not steal an active replay claim', async () => {
+      const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      insertRecord(createRecord(id));
+      claimDueRecords(1, 'active-claim', '1970-01-01T00:00:00.000Z');
+
+      const response = await server.inject({
+        method: 'POST',
+        url: `/webhooks/replay/${id}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        id,
+        status: 'RETRYING',
+        message: 'Record already has an active replay claim',
+        requeued: false,
+      });
+      expect(getRecordById(id)?.claimToken).toBe('active-claim');
     });
 
     it('returns 404 NOT_FOUND for unknown id', async () => {

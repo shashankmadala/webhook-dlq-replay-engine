@@ -1,12 +1,16 @@
+import { randomUUID } from 'node:crypto';
+
 import pino from 'pino';
 
-import { getRetryQueue, updateStatus } from '../db/client';
+import { claimDueRecords, updateClaimedStatus } from '../db/client';
 import { assertSafeUrl, SsrfBlockedError } from '../security/ssrfGuard';
 import type { DeadLetterRecord, DeliveryError, DLQStatus } from '../types';
 import { calculateBackoffMs } from './backoff';
 import { CircuitBreaker } from './circuitBreaker';
+import { staleClaimCutoff } from './claiming';
 
 const logger = pino({ name: 'replay-engine' });
+const CIRCUIT_OPEN_RETRY_DELAY_MS = 60_000;
 
 function buildDeliveryError(
   code: string,
@@ -41,6 +45,10 @@ function nextRetryAtFromDelayMs(delayMs: number): string {
 
 function nextRetryAtFromRetryAfterSeconds(seconds: number): string {
   return new Date(Date.now() + seconds * 1_000).toISOString();
+}
+
+function nextRetryAtFromCircuitOpen(): string {
+  return new Date(Date.now() + CIRCUIT_OPEN_RETRY_DELAY_MS).toISOString();
 }
 
 export class ReplayEngine {
@@ -81,12 +89,13 @@ export class ReplayEngine {
     }
 
     this.processing = true;
+    const claimToken = randomUUID();
 
     try {
-      const records = getRetryQueue(50);
+      const records = claimDueRecords(50, claimToken, staleClaimCutoff());
 
       for (const record of records) {
-        await this.processRecord(record);
+        await this.processRecord(record, claimToken);
       }
     } finally {
       this.processing = false;
@@ -123,7 +132,28 @@ export class ReplayEngine {
     return breaker;
   }
 
-  private async processRecord(record: DeadLetterRecord): Promise<void> {
+  private updateClaimedRecord(
+    record: DeadLetterRecord,
+    claimToken: string,
+    status: DLQStatus,
+    patch?: Partial<DeadLetterRecord>,
+  ): void {
+    const updated = updateClaimedStatus(record.id, claimToken, status, patch);
+
+    if (!updated) {
+      logger.warn({
+        event: 'dlq.claim_completion_lost',
+        recordId: record.id,
+        targetUrl: record.event.targetUrl,
+        status,
+      });
+    }
+  }
+
+  private async processRecord(
+    record: DeadLetterRecord,
+    claimToken: string,
+  ): Promise<void> {
     const url = record.event.targetUrl;
     const now = new Date().toISOString();
 
@@ -139,7 +169,7 @@ export class ReplayEngine {
         this.logTransition(record, record.status, 'DEAD', {
           errorCode: 'SSRF_BLOCKED',
         });
-        updateStatus(record.id, 'DEAD', {
+        this.updateClaimedRecord(record, claimToken, 'DEAD', {
           lastError: buildDeliveryError(
             'SSRF_BLOCKED',
             'The endpoint URL resolves to a blocked IP range',
@@ -161,6 +191,9 @@ export class ReplayEngine {
         recordId: record.id,
         targetUrl: url,
       });
+      this.updateClaimedRecord(record, claimToken, record.status, {
+        nextRetryAt: nextRetryAtFromCircuitOpen(),
+      });
       return;
     }
 
@@ -174,7 +207,7 @@ export class ReplayEngine {
       if (response.status >= 200 && response.status < 300) {
         breaker.recordSuccess();
         this.logTransition(record, record.status, 'DELIVERED');
-        updateStatus(record.id, 'DELIVERED', {
+        this.updateClaimedRecord(record, claimToken, 'DELIVERED', {
           lastAttemptAt: now,
         });
         return;
@@ -189,21 +222,20 @@ export class ReplayEngine {
 
         await this.handleFailure(
           record,
+          claimToken,
           now,
           buildDeliveryError('RATE_LIMITED', 'Target returned HTTP 429', true, 429),
+          retryAfterSeconds !== null
+            ? nextRetryAtFromRetryAfterSeconds(retryAfterSeconds)
+            : undefined,
         );
         breaker.recordFailure();
-
-        if (retryAfterSeconds !== null) {
-          updateStatus(record.id, 'RETRYING', {
-            nextRetryAt: nextRetryAtFromRetryAfterSeconds(retryAfterSeconds),
-          });
-        }
         return;
       }
 
       await this.handleFailure(
         record,
+        claimToken,
         now,
         buildDeliveryError(
           'HTTP_ERROR',
@@ -218,6 +250,7 @@ export class ReplayEngine {
 
       await this.handleFailure(
         record,
+        claimToken,
         now,
         buildDeliveryError('NETWORK_ERROR', message, true),
       );
@@ -227,8 +260,10 @@ export class ReplayEngine {
 
   private async handleFailure(
     record: DeadLetterRecord,
+    claimToken: string,
     now: string,
     lastError: DeliveryError,
+    nextRetryAtOverride?: string,
   ): Promise<void> {
     const nextAttemptCount = record.attemptCount + 1;
     const delayMs = calculateBackoffMs(
@@ -241,16 +276,16 @@ export class ReplayEngine {
       this.logTransition(record, record.status, 'DEAD', {
         errorCode: lastError.code,
       });
-      updateStatus(record.id, 'DEAD', {
+      this.updateClaimedRecord(record, claimToken, 'DEAD', {
         lastError,
         lastAttemptAt: now,
       });
       return;
     }
 
-    const nextRetryAt = nextRetryAtFromDelayMs(delayMs);
+    const nextRetryAt = nextRetryAtOverride ?? nextRetryAtFromDelayMs(delayMs);
     this.logTransition(record, record.status, 'RETRYING', { nextRetryAt });
-    updateStatus(record.id, 'RETRYING', {
+    this.updateClaimedRecord(record, claimToken, 'RETRYING', {
       attemptCount: nextAttemptCount,
       nextRetryAt,
       lastAttemptAt: now,

@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS dead_letter_records (
   attempt_count INTEGER NOT NULL DEFAULT 0,
   last_attempted_at TEXT,
   next_retry_at TEXT,
+  claim_token TEXT,
+  claimed_at TEXT,
   created_at TEXT NOT NULL,
   error_log TEXT
 );
