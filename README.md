@@ -16,8 +16,18 @@ npx ts-node src/index.ts
 POST /webhooks/ingest       — ingest a failed webhook
 GET  /webhooks/dead-letters — list dead records (cursor paginated)
 POST /webhooks/replay/:id   — manually trigger replay
+GET  /metrics               — JSON runtime counters and uptime
 GET  /health                — liveness + DB connectivity probe
+
+The existing metrics endpoint is JSON only. `/metrics/prometheus` is not implemented.
 
 ## Test
 npm test
 npm run test:coverage
+
+## Runtime Verification
+npm run verify:runtime
+
+This starts the Fastify app on an ephemeral local port, checks `GET /health`
+and `GET /metrics` over real HTTP, validates the metrics JSON shape, and
+cleans up its temporary SQLite database.
