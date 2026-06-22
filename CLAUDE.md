@@ -19,8 +19,14 @@ This repository is a Node.js/TypeScript webhook Dead Letter Queue replay engine.
 
 ## Quality Gates
 
+Primary gates:
+
 - `npm run verify`
 - `npm run verify:full`
+- CI
+
+Supporting checks:
+
 - `npm run typecheck`
 - `npm test`
 - `npm run verify:runtime`
@@ -39,6 +45,7 @@ Every implementation pass should report:
 
 - Do not use `/admin/*` routes unless auth exists.
 - Replay completion must be guarded by claim token.
+- Stale claim recovery is part of the replay safety model.
 - SQLite datetime comparisons must use the same ISO format as stored timestamps.
 - Every endpoint change must include one negative test.
 - Security-sensitive Node API assumptions must be runtime-verified.

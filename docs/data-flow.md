@@ -5,8 +5,8 @@
                                     │                    EXTERNAL SYSTEMS                      │
                                     └─────────────────────────────────────────────────────────┘
                                                               │
-  Inbound Webhook                                             │
-  (POST /webhooks)                                            ▼
+  Failed Webhook                                              │
+  (POST /webhooks/ingest)                                     ▼
        │                                          ┌───────────────────────┐
        │                                          │   Target Endpoint     │
        │                                          │   (downstream URL)    │
@@ -18,13 +18,14 @@
 │  LAYER           │                              │   (HTTP client)       │
 │                  │                              └───────────▲───────────┘
 │  • Validate      │                                          │
-│  • Normalize     │         success (2xx)                    │
-│  • Attempt       │──────────────────────────────────────────┤
-│    delivery      │                                          │
+│  • SSRF check    │                                          │
+│  • Persist       │                                          │
+│    PENDING       │                                          │
+│  • Return 202    │                                          │
 └────────┬─────────┘                                          │
          │                                                    │
-         │ failure (timeout,                                   │
-         │ 4xx/5xx, network)                                  │
+         │ durable record                                     │
+         │ status: PENDING                                    │
          ▼                                                    │
 ┌──────────────────┐         read due entries                 │
 │   DLQ STORE      │◄─────────────────────────────────────────┤
@@ -35,8 +36,7 @@
 │  • audit_log     │                                          │
 └────────┬─────────┘                                          │
          │                                                    │
-         │ enqueue / persist                                  │
-         │ status: PENDING                                    │
+         │ scheduler/manual replay                            │
          ▼                                                    │
 ┌──────────────────┐         trigger replay                  │
 │  REPLAY ENGINE   │──────────────────────────────────────────┘
@@ -65,15 +65,14 @@
 
 ## Flow summary
 
-1. **Inbound Webhook** hits the ingestion endpoint.
-2. **Ingestion Layer** validates and attempts immediate delivery to the target.
-3. On failure, a dead letter record is persisted in SQLite with status `PENDING` and `next_retry_at`.
-4. **Replay Engine** (scheduler or manual API) picks due entries, sets `RETRYING`, and re-invokes delivery.
-5. **Target Endpoint** receives the replayed payload.
-6. **Status Update** writes `DELIVERED` or re-queues with backoff; after max retries or TTL expiry, `DEAD`.
+1. **Failed Webhook** is submitted to `POST /webhooks/ingest`.
+2. **Ingestion Layer** validates the payload, checks SSRF safety for the target URL, persists a SQLite DLQ record with status `PENDING`, and returns `202`.
+3. **Replay Engine** later picks eligible records through the scheduler or manual replay APIs.
+4. **Delivery Service** sends the persisted payload to the target endpoint during replay.
+5. **Status Update** writes `DELIVERED` on 2xx, re-queues with backoff on retryable failure, or writes `DEAD` after max retries, TTL expiry, or non-retryable safety failure.
 
 ## Pipeline
 
 ```
-Inbound Webhook → Ingestion Layer → DLQ Store → Replay Engine → Target Endpoint → Status Update
+Failed Webhook → Ingestion Layer → DLQ Store → Replay Engine → Target Endpoint → Status Update
 ```
